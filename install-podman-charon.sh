@@ -32,11 +32,32 @@ REGISTRY_MIRRORS=(
 # ==============================================================================
 # 🚀 脚本主体
 # ==============================================================================
-
 echo "🔧 开始配置 Charon 反向代理..."
 echo "   用户: $CURRENT_USER (UID: $USER_UID)"
 echo "   集中目录: $CHARON_BASE_DIR"
 echo ""
+
+# ==============================================================================
+# ⚠️  root 用户检测与确认
+# ==============================================================================
+
+if [[ "$CURRENT_USER" == "root" ]]; then
+    echo "⚠️  警告: 检测到您正在以 root 用户身份运行此脚本。"
+    echo "   本脚本专为 Rootless Podman 设计，建议使用普通用户执行。"
+    echo "   以 root 运行可能导致权限配置异常。"
+    echo ""
+    echo "   是否仍要继续？(y/N) [10秒后自动选择 N]"
+    read -t 10 -r response || true
+    case "$response" in
+        [yY][eE][sS]|[yY])
+            echo "   已确认，将继续执行..."
+            ;;
+        *)
+            echo "   ❌ 安装已取消。请切换到普通用户后重新运行。"
+            exit 0
+            ;;
+    esac
+fi
 
 # ------------------------------------------------------------------------------
 # 1. 安装 Podman 与 podman-compose
@@ -110,18 +131,42 @@ echo "   ✅ 已配置镜像加速器"
 # ------------------------------------------------------------------------------
 # 4. 启用 Podman 用户级 Socket
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 4. 启用 Podman 用户级 Socket (适配 root 用户)
+# ------------------------------------------------------------------------------
 echo ""
 echo "🔌 [4/8] 启用 Podman 用户级 Socket..."
 
-systemctl --user enable --now podman.socket 2>/dev/null || true
-
-if ! systemctl --user is-active podman.socket &>/dev/null; then
-    echo "   ❌ Podman socket 未正常运行"
-    exit 1
+# 判断当前用户是否为 root
+if [[ "$CURRENT_USER" == "root" ]]; then
+    echo "   ⚠️ 检测到 root 用户，将使用系统级 Podman socket。"
+    # 为 root 用户设置必要的环境变量
+    export XDG_RUNTIME_DIR="/run/user/0"
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/0/bus"
+    # 尝试启动系统级 podman.socket
+    systemctl enable --now podman.socket
+    # 检查 socket 是否激活
+    if ! systemctl is-active podman.socket &>/dev/null; then
+        echo "   ❌ 系统级 Podman socket 未能启动。"
+        echo "      请尝试手动执行: systemctl enable --now podman.socket"
+        exit 1
+    fi
+    PODMAN_SOCK_PATH="/run/podman/podman.sock"
+else
+    # 普通用户，保持原有逻辑
+    systemctl --user enable --now podman.socket 2>/dev/null || true
+    if ! systemctl --user is-active podman.socket &>/dev/null; then
+        echo "   ❌ Podman socket 未正常运行"
+        exit 1
+    fi
+    PODMAN_SOCK_PATH="/run/user/$USER_UID/podman/podman.sock"
 fi
 
-PODMAN_SOCK_PATH="/run/user/$USER_UID/podman/podman.sock"
-[[ -S "$PODMAN_SOCK_PATH" ]] || { echo "   ❌ socket 文件不存在"; exit 1; }
+# 验证 socket 文件是否存在
+if [[ ! -S "$PODMAN_SOCK_PATH" ]]; then
+    echo "   ❌ socket 文件不存在: $PODMAN_SOCK_PATH"
+    exit 1
+fi
 echo "   ✅ Podman socket 就绪: $PODMAN_SOCK_PATH"
 
 # ------------------------------------------------------------------------------
@@ -254,7 +299,7 @@ ExecStart=/usr/bin/podman run --rm --name charon \\
   --env-file $CHARON_ENV_FILE \\
   -e ALLOW_DOCKER_SOCK_GID_0=true \\
   -v $CHARON_BASE_DIR/charon-data:/app/data:U \\
-  -v /run/user/$USER_UID/podman/podman.sock:/var/run/docker.sock:ro \\
+  -v $PODMAN_SOCK_PATH:/var/run/docker.sock:ro \\
   -e TZ=$TIMEZONE \\
   $CHARON_IMAGE
 
