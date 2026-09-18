@@ -1,12 +1,7 @@
 #!/bin/bash
 #
-# Charon 反向代理 - 一键安装与 Socket Activation 配置脚本 (密钥管理版)
+# Charon 反向代理 - 一键安装与 Socket Activation 配置脚本 (可选容器发现版)
 # 适用系统: Ubuntu 22.04 / 24.04 LTS
-#
-# 特点:
-#   - 密钥集中存储在 /opt/podman/charon/charon.env，方便迁移
-#   - 脚本可重复运行，不会覆盖已有密钥
-#   - 如果 .env 存在但格式不符，会提示并退出，避免破坏数据
 #
 
 set -euo pipefail
@@ -32,13 +27,14 @@ REGISTRY_MIRRORS=(
 # ==============================================================================
 # 🚀 脚本主体
 # ==============================================================================
+
 echo "🔧 开始配置 Charon 反向代理..."
 echo "   用户: $CURRENT_USER (UID: $USER_UID)"
 echo "   集中目录: $CHARON_BASE_DIR"
 echo ""
 
 # ==============================================================================
-# ⚠️  root 用户检测与确认
+# ⚠️  root 用户检测
 # ==============================================================================
 
 if [[ "$CURRENT_USER" == "root" ]]; then
@@ -59,9 +55,31 @@ if [[ "$CURRENT_USER" == "root" ]]; then
     esac
 fi
 
+# ==============================================================================
+# 🔍 询问是否启用本地容器发现
+# ==============================================================================
+
+echo ""
+echo "🔍 是否启用本地容器自动发现？"
+echo "   此功能允许 Charon 自动检测本机上的容器并为其创建代理规则。"
+echo "   如果你只代理远程主机（如内网服务器）上的服务，无需启用。"
+echo ""
+read -t 15 -r -p "   启用容器自动发现？(y/N) [15秒后默认 N]: " ENABLE_DISCOVERY || true
+case "${ENABLE_DISCOVERY:-}" in
+    [yY][eE][sS]|[yY])
+        ENABLE_DISCOVERY=true
+        echo "   ✅ 将启用容器自动发现"
+        ;;
+    *)
+        ENABLE_DISCOVERY=false
+        echo "   ℹ️  跳过容器自动发现（跨主机场景下的推荐配置）"
+        ;;
+esac
+
 # ------------------------------------------------------------------------------
 # 1. 安装 Podman 与 podman-compose
 # ------------------------------------------------------------------------------
+echo ""
 echo "📦 [1/8] 检查并安装 Podman 与 podman-compose..."
 
 if ! command -v podman &> /dev/null; then
@@ -129,45 +147,37 @@ sudo mkdir -p /etc/containers
 echo "   ✅ 已配置镜像加速器"
 
 # ------------------------------------------------------------------------------
-# 4. 启用 Podman 用户级 Socket
-# ------------------------------------------------------------------------------
-# ------------------------------------------------------------------------------
-# 4. 启用 Podman 用户级 Socket (适配 root 用户)
+# 4. 启用 Podman Socket (仅在启用容器发现时)
 # ------------------------------------------------------------------------------
 echo ""
-echo "🔌 [4/8] 启用 Podman 用户级 Socket..."
+echo "🔌 [4/8] 配置 Podman Socket..."
 
-# 判断当前用户是否为 root
-if [[ "$CURRENT_USER" == "root" ]]; then
-    echo "   ⚠️ 检测到 root 用户，将使用系统级 Podman socket。"
-    # 为 root 用户设置必要的环境变量
-    export XDG_RUNTIME_DIR="/run/user/0"
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/0/bus"
-    # 尝试启动系统级 podman.socket
-    systemctl enable --now podman.socket
-    # 检查 socket 是否激活
-    if ! systemctl is-active podman.socket &>/dev/null; then
-        echo "   ❌ 系统级 Podman socket 未能启动。"
-        echo "      请尝试手动执行: systemctl enable --now podman.socket"
-        exit 1
+if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
+    if [[ "$CURRENT_USER" == "root" ]]; then
+        # root 用户：使用系统级 Podman socket
+        echo "   ⚠️ root 用户，使用系统级 Podman socket"
+        systemctl enable --now podman.socket 2>/dev/null || true
+        if ! systemctl is-active podman.socket &>/dev/null; then
+            echo "   ❌ 系统级 Podman socket 未正常运行"
+            exit 1
+        fi
+        PODMAN_SOCK_PATH="/run/podman/podman.sock"
+    else
+        # 普通用户：使用用户级 Podman socket
+        systemctl --user enable --now podman.socket 2>/dev/null || true
+        if ! systemctl --user is-active podman.socket &>/dev/null; then
+            echo "   ❌ 用户级 Podman socket 未正常运行"
+            exit 1
+        fi
+        PODMAN_SOCK_PATH="/run/user/$USER_UID/podman/podman.sock"
     fi
-    PODMAN_SOCK_PATH="/run/podman/podman.sock"
+
+    [[ -S "$PODMAN_SOCK_PATH" ]] || { echo "   ❌ socket 文件不存在: $PODMAN_SOCK_PATH"; exit 1; }
+    echo "   ✅ Podman socket 就绪: $PODMAN_SOCK_PATH"
 else
-    # 普通用户，保持原有逻辑
-    systemctl --user enable --now podman.socket 2>/dev/null || true
-    if ! systemctl --user is-active podman.socket &>/dev/null; then
-        echo "   ❌ Podman socket 未正常运行"
-        exit 1
-    fi
-    PODMAN_SOCK_PATH="/run/user/$USER_UID/podman/podman.sock"
+    PODMAN_SOCK_PATH=""
+    echo "   ℹ️  已跳过（未启用容器自动发现）"
 fi
-
-# 验证 socket 文件是否存在
-if [[ ! -S "$PODMAN_SOCK_PATH" ]]; then
-    echo "   ❌ socket 文件不存在: $PODMAN_SOCK_PATH"
-    exit 1
-fi
-echo "   ✅ Podman socket 就绪: $PODMAN_SOCK_PATH"
 
 # ------------------------------------------------------------------------------
 # 5. 创建集中管理目录
@@ -187,11 +197,9 @@ echo "   ✅ 目录已创建: $CHARON_BASE_DIR"
 echo ""
 echo "🔑 [6/8] 管理密钥文件..."
 
-# 6a. 检查 .env 是否已存在
 if [[ -f "$CHARON_ENV_FILE" ]]; then
     echo "   ⏳ 检测到已存在的密钥文件: $CHARON_ENV_FILE"
-    
-    # 验证文件是否包含所需的两个变量且值非空
+
     if grep -q '^CHARON_JWT_SECRET=.\+' "$CHARON_ENV_FILE" && \
        grep -q '^CHARON_ENCRYPTION_KEY=.\+' "$CHARON_ENV_FILE"; then
         echo "   ✅ 密钥文件格式正确，将直接使用现有密钥。"
@@ -211,12 +219,10 @@ if [[ -f "$CHARON_ENV_FILE" ]]; then
     fi
 else
     echo "   ⏳ 未检测到密钥文件，正在生成新密钥..."
-    
-    # 生成两个密钥
+
     NEW_JWT_SECRET="$(openssl rand -hex 32)"
     NEW_ENCRYPTION_KEY="$(openssl rand -base64 32)"
-    
-    # 写入 .env 文件
+
     cat > "$CHARON_ENV_FILE" <<EOF
 # Charon 密钥文件 - 请妥善备份，勿泄露
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -224,14 +230,12 @@ CHARON_JWT_SECRET=$NEW_JWT_SECRET
 CHARON_ENCRYPTION_KEY=$NEW_ENCRYPTION_KEY
 EOF
 
-    # 设置严格权限：仅所有者可读写
     chmod 600 "$CHARON_ENV_FILE"
-    
+
     echo "   ✅ 已生成新密钥并保存至: $CHARON_ENV_FILE"
     echo "   🔐 请务必备份此文件！丢失 CHARON_ENCRYPTION_KEY 将无法解密已有数据。"
 fi
 
-# 再次确认文件可读
 if [[ ! -r "$CHARON_ENV_FILE" ]]; then
     echo "   ❌ 错误: 密钥文件不可读，请检查权限。"
     exit 1
@@ -259,7 +263,6 @@ fi
 echo ""
 echo "⚙️  [8/8] 生成 Systemd 单元文件并启用..."
 
-# --- 8a. Socket 单元文件 ---
 cat > "$CHARON_BASE_DIR/charon.socket" <<EOF
 [Unit]
 Description=Charon Reverse Proxy Socket
@@ -273,7 +276,13 @@ ListenStream=443
 WantedBy=sockets.target
 EOF
 
-# --- 8b. Service 单元文件 (使用 --env-file 引用密钥) ---
+# --- 根据 ENABLE_DISCOVERY 决定是否挂载 Podman socket ---
+if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
+    PODMAN_SOCK_LINE="  -e ALLOW_DOCKER_SOCK_GID_0=true \\\\\n  -v $PODMAN_SOCK_PATH:/var/run/docker.sock:ro \\\\"
+else
+    PODMAN_SOCK_LINE=""
+fi
+
 cat > "$CHARON_BASE_DIR/charon.service" <<EOF
 [Unit]
 Description=Charon Reverse Proxy (Rootless Podman, Socket Activation)
@@ -297,9 +306,8 @@ ExecStart=/usr/bin/podman run --rm --name charon \\
   --sdnotify=conmon \\
   --preserve-fds=1 \\
   --env-file $CHARON_ENV_FILE \\
-  -e ALLOW_DOCKER_SOCK_GID_0=true \\
+$PODMAN_SOCK_LINE
   -v $CHARON_BASE_DIR/charon-data:/app/data:U \\
-  -v $PODMAN_SOCK_PATH:/var/run/docker.sock:ro \\
   -e TZ=$TIMEZONE \\
   $CHARON_IMAGE
 
@@ -341,13 +349,17 @@ echo ""
 echo "📌 管理界面:  http://你的服务器IP:8080"
 echo "📌 密钥文件:  $CHARON_ENV_FILE"
 echo "📌 数据目录:  $CHARON_BASE_DIR/charon-data"
+if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
+    echo "📌 容器发现:  已启用（socket: $PODMAN_SOCK_PATH）"
+else
+    echo "📌 容器发现:  未启用（手动添加代理规则）"
+fi
 echo ""
 echo "💡 迁移提示："
 echo "   若要将 Charon 迁移到其他服务器，请完整复制以下内容："
 echo "     - $CHARON_BASE_DIR/charon.env"
 echo "     - $CHARON_BASE_DIR/charon-data/"
-echo "   然后在新服务器上运行本脚本即可。脚本会检测到已有密钥并直接使用，"
-echo "   确保原有加密数据可以正常解密。"
+echo "   然后在新服务器上运行本脚本即可。"
 echo ""
 echo "🔍 验证命令："
 echo "   sudo systemctl status charon.socket"
