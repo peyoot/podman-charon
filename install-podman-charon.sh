@@ -1,7 +1,9 @@
 #!/bin/bash
 #
-# Charon 反向代理 - 一键安装与 Socket Activation 配置脚本 (可选容器发现版)
+# Charon Proxy 反向代理 - 一键安装与 Socket Activation 配置脚本
 # 适用系统: Ubuntu 22.04 / 24.04 LTS
+#
+# 注意: 服务名和容器名统一使用 charon-proxy，避免与 strongSwan 的 charon 守护进程冲突
 #
 
 set -euo pipefail
@@ -10,8 +12,9 @@ set -euo pipefail
 # 🎯 配置区域
 # ==============================================================================
 
-CHARON_BASE_DIR="/opt/podman/charon"
-CHARON_ENV_FILE="$CHARON_BASE_DIR/charon.env"
+CHARON_BASE_DIR="/opt/podman/charon-proxy"
+CHARON_ENV_FILE="$CHARON_BASE_DIR/charon-proxy.env"
+CHARON_SERVICE_NAME="charon-proxy"
 TIMEZONE="Asia/Shanghai"
 CHARON_IMAGE="docker.io/wikid82/charon:latest"
 
@@ -28,9 +31,10 @@ REGISTRY_MIRRORS=(
 # 🚀 脚本主体
 # ==============================================================================
 
-echo "🔧 开始配置 Charon 反向代理..."
+echo "🔧 开始配置 Charon Proxy 反向代理..."
 echo "   用户: $CURRENT_USER (UID: $USER_UID)"
 echo "   集中目录: $CHARON_BASE_DIR"
+echo "   服务名: $CHARON_SERVICE_NAME"
 echo ""
 
 # ==============================================================================
@@ -61,7 +65,7 @@ fi
 
 echo ""
 echo "🔍 是否启用本地容器自动发现？"
-echo "   此功能允许 Charon 自动检测本机上的容器并为其创建代理规则。"
+echo "   此功能允许 Charon Proxy 自动检测本机上的容器并为其创建代理规则。"
 echo "   如果你只代理远程主机（如内网服务器）上的服务，无需启用。"
 echo ""
 read -t 15 -r -p "   启用容器自动发现？(y/N) [15秒后默认 N]: " ENABLE_DISCOVERY || true
@@ -154,7 +158,6 @@ echo "🔌 [4/8] 配置 Podman Socket..."
 
 if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
     if [[ "$CURRENT_USER" == "root" ]]; then
-        # root 用户：使用系统级 Podman socket
         echo "   ⚠️ root 用户，使用系统级 Podman socket"
         systemctl enable --now podman.socket 2>/dev/null || true
         if ! systemctl is-active podman.socket &>/dev/null; then
@@ -163,7 +166,6 @@ if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
         fi
         PODMAN_SOCK_PATH="/run/podman/podman.sock"
     else
-        # 普通用户：使用用户级 Podman socket
         systemctl --user enable --now podman.socket 2>/dev/null || true
         if ! systemctl --user is-active podman.socket &>/dev/null; then
             echo "   ❌ 用户级 Podman socket 未正常运行"
@@ -224,7 +226,7 @@ else
     NEW_ENCRYPTION_KEY="$(openssl rand -base64 32)"
 
     cat > "$CHARON_ENV_FILE" <<EOF
-# Charon 密钥文件 - 请妥善备份，勿泄露
+# Charon Proxy 密钥文件 - 请妥善备份，勿泄露
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 CHARON_JWT_SECRET=$NEW_JWT_SECRET
 CHARON_ENCRYPTION_KEY=$NEW_ENCRYPTION_KEY
@@ -263,9 +265,10 @@ fi
 echo ""
 echo "⚙️  [8/8] 生成 Systemd 单元文件并启用..."
 
-cat > "$CHARON_BASE_DIR/charon.socket" <<EOF
+# --- 8a. Socket 单元文件 ---
+cat > "$CHARON_BASE_DIR/$CHARON_SERVICE_NAME.socket" <<EOF
 [Unit]
-Description=Charon Reverse Proxy Socket
+Description=Charon Proxy Reverse Proxy Socket
 
 [Socket]
 ListenStream=80
@@ -276,21 +279,22 @@ ListenStream=443
 WantedBy=sockets.target
 EOF
 
-# --- 根据 ENABLE_DISCOVERY 决定是否挂载 Podman socket ---
+# --- 8b. 根据 ENABLE_DISCOVERY 决定是否挂载 Podman socket ---
 if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
     PODMAN_SOCK_LINE="  -e ALLOW_DOCKER_SOCK_GID_0=true \\\\\n  -v $PODMAN_SOCK_PATH:/var/run/docker.sock:ro \\\\"
 else
     PODMAN_SOCK_LINE=""
 fi
 
-cat > "$CHARON_BASE_DIR/charon.service" <<EOF
+# --- 8c. Service 单元文件 ---
+cat > "$CHARON_BASE_DIR/$CHARON_SERVICE_NAME.service" <<EOF
 [Unit]
-Description=Charon Reverse Proxy (Rootless Podman, Socket Activation)
+Description=Charon Proxy Reverse Proxy (Rootless Podman, Socket Activation)
 After=network-online.target
 Wants=network-online.target
 
-Requires=charon.socket
-After=charon.socket
+Requires=$CHARON_SERVICE_NAME.socket
+After=$CHARON_SERVICE_NAME.socket
 
 [Service]
 Type=notify
@@ -301,7 +305,7 @@ Group=$CURRENT_USER
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
-ExecStart=/usr/bin/podman run --rm --name charon \\
+ExecStart=/usr/bin/podman run --rm --name $CHARON_SERVICE_NAME \\
   --network=host \\
   --sdnotify=conmon \\
   --preserve-fds=1 \\
@@ -311,7 +315,7 @@ $PODMAN_SOCK_LINE
   -e TZ=$TIMEZONE \\
   $CHARON_IMAGE
 
-ExecStop=/usr/bin/podman stop -t 10 charon
+ExecStop=/usr/bin/podman stop -t 10 $CHARON_SERVICE_NAME
 Restart=on-failure
 RestartSec=5
 
@@ -321,32 +325,34 @@ EOF
 
 echo "   ✅ 单元文件已生成"
 
-sudo ln -sf "$CHARON_BASE_DIR/charon.socket" /etc/systemd/system/charon.socket
-sudo ln -sf "$CHARON_BASE_DIR/charon.service" /etc/systemd/system/charon.service
+# --- 8d. 安装为系统级服务 ---
+sudo ln -sf "$CHARON_BASE_DIR/$CHARON_SERVICE_NAME.socket" "/etc/systemd/system/$CHARON_SERVICE_NAME.socket"
+sudo ln -sf "$CHARON_BASE_DIR/$CHARON_SERVICE_NAME.service" "/etc/systemd/system/$CHARON_SERVICE_NAME.service"
 
 sudo systemctl daemon-reload
 
 echo "🧹 清理旧状态..."
-sudo systemctl stop charon.socket charon.service 2>/dev/null || true
-sudo systemctl reset-failed charon.socket charon.service 2>/dev/null || true
+sudo systemctl stop "$CHARON_SERVICE_NAME.socket" "$CHARON_SERVICE_NAME.service" 2>/dev/null || true
+sudo systemctl reset-failed "$CHARON_SERVICE_NAME.socket" "$CHARON_SERVICE_NAME.service" 2>/dev/null || true
 
-echo "🚀 启用并启动 Charon Socket..."
-sudo systemctl enable --now charon.socket
+echo "🚀 启用并启动 Charon Proxy Socket..."
+sudo systemctl enable --now "$CHARON_SERVICE_NAME.socket"
 
 sleep 1
-if ! sudo systemctl is-active charon.socket &>/dev/null; then
+if ! sudo systemctl is-active "$CHARON_SERVICE_NAME.socket" &>/dev/null; then
     echo "   ❌ socket 未激活"
-    sudo journalctl -u charon.socket -n 20 --no-pager
+    sudo journalctl -u "$CHARON_SERVICE_NAME.socket" -n 20 --no-pager
     exit 1
 fi
 
-echo "   ✅ charon.socket 已激活"
+echo "   ✅ $CHARON_SERVICE_NAME.socket 已激活"
 echo ""
 echo "=========================================="
-echo "✅ Charon 配置完成！"
+echo "✅ Charon Proxy 配置完成！"
 echo "=========================================="
 echo ""
 echo "📌 管理界面:  http://你的服务器IP:8080"
+echo "📌 服务名:    $CHARON_SERVICE_NAME"
 echo "📌 密钥文件:  $CHARON_ENV_FILE"
 echo "📌 数据目录:  $CHARON_BASE_DIR/charon-data"
 if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
@@ -356,12 +362,13 @@ else
 fi
 echo ""
 echo "💡 迁移提示："
-echo "   若要将 Charon 迁移到其他服务器，请完整复制以下内容："
-echo "     - $CHARON_BASE_DIR/charon.env"
+echo "   若要将 Charon Proxy 迁移到其他服务器，请完整复制以下内容："
+echo "     - $CHARON_ENV_FILE"
 echo "     - $CHARON_BASE_DIR/charon-data/"
 echo "   然后在新服务器上运行本脚本即可。"
 echo ""
-echo "🔍 验证命令："
-echo "   sudo systemctl status charon.socket"
-echo "   sudo systemctl status charon.service"
-echo "   podman ps -a --filter name=charon"
+echo "🔍 常用命令："
+echo "   查看 socket 状态:  sudo systemctl status $CHARON_SERVICE_NAME.socket"
+echo "   查看服务状态:      sudo systemctl status $CHARON_SERVICE_NAME.service"
+echo "   查看容器状态:      podman ps -a --filter name=$CHARON_SERVICE_NAME"
+echo "   查看日志:          sudo journalctl -u $CHARON_SERVICE_NAME.service -f"
