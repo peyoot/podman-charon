@@ -146,13 +146,14 @@ fi
 echo ""
 echo "⚙️ [6/6] 生成 systemd 单元并启动..."
 
-# 可选：挂载 podman socket 用于容器发现
+# 可选：容器发现时挂载 podman socket。为空时仅多一个空格，不影响 systemd 解析。
 if [[ "$ENABLE_DISCOVERY" == "true" ]]; then
-    DISCOVERY_LINE="  -v $PODMAN_SOCK_PATH:/var/run/docker.sock:ro \\"
+    DISCOVERY_ARG="-v $PODMAN_SOCK_PATH:/var/run/docker.sock:ro"
 else
-    DISCOVERY_LINE=""
+    DISCOVERY_ARG=""
 fi
 
+# 关键：ExecStart 写成【单行】，避免反斜杠续行遇到空变量时断裂
 sudo tee "/etc/systemd/system/$CHARON_SERVICE_NAME.service" > /dev/null <<EOF
 [Unit]
 Description=Charon Proxy Reverse Proxy (Rootful Podman, host network)
@@ -166,14 +167,7 @@ Environment=PODMAN_SYSTEMD_UNIT=%n
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
-ExecStart=/usr/bin/podman run --rm --replace --name $CHARON_SERVICE_NAME \\
-  --network=host \\
-  --sdnotify=conmon \\
-  --env-file $CHARON_ENV_FILE \\
-$DISCOVERY_LINE
-  -v $CHARON_BASE_DIR/charon-data:/app/data:U \\
-  -e TZ=$TIMEZONE \\
-  $CHARON_IMAGE
+ExecStart=/usr/bin/podman run --rm --replace --name $CHARON_SERVICE_NAME --network=host --sdnotify=conmon --env-file $CHARON_ENV_FILE $DISCOVERY_ARG -v $CHARON_BASE_DIR/charon-data:/app/data:U -e TZ=$TIMEZONE $CHARON_IMAGE
 ExecStop=/usr/bin/podman stop -t 10 $CHARON_SERVICE_NAME
 
 [Install]
