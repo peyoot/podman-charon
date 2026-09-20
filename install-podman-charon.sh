@@ -305,15 +305,7 @@ Group=$CURRENT_USER
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
-ExecStart=/usr/bin/podman run --rm --name $CHARON_SERVICE_NAME \\
-  --network=host \\
-  --sdnotify=conmon \\
-  --preserve-fds=1 \\
-  --env-file $CHARON_ENV_FILE \\
-$PODMAN_SOCK_LINE
-  -v $CHARON_BASE_DIR/charon-data:/app/data:U \\
-  -e TZ=$TIMEZONE \\
-  $CHARON_IMAGE
+ExecStart=/usr/bin/podman run --rm --name $CHARON_SERVICE_NAME --network=host --sdnotify=conmon --preserve-fds=1 --env-file $CHARON_ENV_FILE $PODMAN_SOCK_LINE -v $CHARON_BASE_DIR/charon-data:/app/data:U -e TZ=$TIMEZONE $CHARON_IMAGE
 
 ExecStop=/usr/bin/podman stop -t 10 $CHARON_SERVICE_NAME
 Restart=on-failure
