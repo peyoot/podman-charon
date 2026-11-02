@@ -25,9 +25,8 @@ TIMEZONE="Asia/Shanghai"
 CHARON_IMAGE="docker.io/wikid82/charon:latest"
 
 REGISTRY_MIRRORS=(
-    "docker.xuanyuan.me"
-    "docker.m.daocloud.io"
     "docker.1ms.run"
+    "docker.m.daocloud.io"
 )
 
 # ==============================================================================
